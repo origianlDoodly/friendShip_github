@@ -1,0 +1,399 @@
+CREATE OR REPLACE PROCEDURE BXERP."PROC_HR_TIME_YEAR_BATCH" 
+(
+    P_COMPANY_CODE      IN VARCHAR2                -- 회사코드
+    , P_BASE_DTE        IN VARCHAR2                -- 계산년월
+    , P_EMP_NO          IN VARCHAR2                -- 사번
+    , P_INPUT_DUTY_ID   IN VARCHAR2                -- 처리자
+)
+/*==============================================================================================================
+    1. 프로그램 명 : PROC_HR_TIME_YEAR_CALC_BATCH
+    2. 유       형 : Store Procdure
+    3. 처 리 내 용 : 1년미만 월만근연차 생성 및 발령시 리프레쉬휴가 생성
+    4. 작 성 일 자 : 2020. 05. 04
+    5. 작  성  자  : 정혜린
+==============================================================================================================*/
+IS
+
+    V_CUR_DTE           VARCHAR2(8);       -- 기준일자
+
+    V_MON_CNT           NUMBER(5,0);       -- 근속월수
+
+    V_BASE_CNT          NUMBER(5,0);       -- 발생연차 기준 : 15개
+    V_ADD_CNT           NUMBER(7,4);       -- 추가발생연차
+    V_MAX_CNT           NUMBER(5,0);       -- 발생연차 MAX : 25개
+
+    V_NEW_CNT           NUMBER(5,2);       -- 발생연차
+    V_IWEOL_CNT         NUMBER(5,2);       -- 이월연차(중도입사자 전년도 미사용분 월차)
+    V_DANG_CNT          NUMBER(5,2);       -- 당해년도 발생월차(중도입사자)
+    V_EXCE_CNT          NUMBER(5,2);       -- 전년도초과사용연차
+    V_SPEC_CNT          NUMBER(5,2);       -- 체력단련 발생휴가
+    V_YEAR_CNT          NUMBER(5,2);       -- 당해년도연차합계
+
+    V_HALF_USE          NUMBER(5,2);       -- 당해년도반차사용
+    V_HHALF_USE          NUMBER(5,2);       -- 당해년도반반차사용
+    V_YEAR_USE          NUMBER(5,0);       -- 당해년도연차사용
+    V_SPEC_USE          NUMBER(5,0);       -- 체력단련(리프레쉬)휴가사용
+    V_USE_CNT           NUMBER(5,2);       -- 연차사용 + 반차사용+반반차사용
+    V_ETC_CNT           NUMBER(5,2);       -- 기타지급연차(연차)
+
+    V_YEAR_PAY_CNT      NUMBER(5,2);       -- 지급기준연차
+    V_YEARMI_USE        NUMBER(5,2);       -- 미사용일수
+
+    V_GUNSOK_DAY        NUMBER(5,0);       -- 총 근속일수
+    V_GUNSOK_YY         NUMBER(5,0);       -- 근속년수
+    V_GUNSOK_MM         NUMBER(5,0);       -- 근속월수
+    V_GUNSOK_DD         NUMBER(5,0);       -- 근속일수
+    V_GUNSOK_RATE       NUMBER(5,0);     -- 총 근속비율
+
+    V_YEAR_DD           NUMBER(5,0);       -- 계산 년 일수 (365 OR 366)
+
+    V_CALC_T_DTE        VARCHAR2(8);
+--    MY_EXCEPTION   EXCEPTION;
+
+BEGIN
+
+    DBMS_OUTPUT.ENABLE;
+
+    -- 기준년월 말일자  : 미리 계산되는게 아니라면 기준년월 1일자로 계산 변경.
+    V_CUR_DTE := P_BASE_DTE || TO_CHAR(LAST_DAY(TO_DATE(P_BASE_DTE || '01', 'YYYYMMDD')), 'DD');
+
+    V_YEAR_DD  := 365;           -- 1년 = 365일
+
+    V_BASE_CNT := 15;
+    V_MAX_CNT  := 25;
+
+-- ===============================================================================
+--   1. 연차 생성 대상자 CURSOR
+-- ===============================================================================
+	FOR T1 IN
+    (
+		SELECT
+			A.COMPANY_CODE
+			, A.EMP_NO
+			, A.STR_DTE
+			, CASE WHEN A.END_DTE <= V_CUR_DTE THEN A.END_DTE ELSE '' END AS END_DTE
+			, A.IN_COMP_DTE
+			, NVL(A.IN_COMP_DTE, A.STR_DTE) AS CALC_F_DTE
+  		    , REPLACE(A.EARNER_DIV, 'HR011', '') AS PERS_OPT    --1:임원,2:직원, 3:계약직 
+--  		    리프레쉬휴가 제외 직급 임원(상무 : HR129D2, 전무 : HR129D1, 부사장 : HR129A2, 사장 : HR129A1, 대표이사,회장:HR129A0) , 비상근감사 : HR129B2,비상근고문:HR129B3, 사외이사:HR129E3
+            , CASE WHEN LEVEL_DIV IN ('HR129A0','HR129A1','HR129A2','HR129D2','HR129D1','HR129B2','HR129B3', 'HR129E3') THEN 'N' ELSE 'Y' END AS SPEC_YN
+            , NVL(A.YEAR_CNT_YN, 'N') AS CALC_YN  --연차생성체크된 기준으로 연차계산.
+        FROM HR_PERS_MASTER A
+        WHERE A.COMPANY_CODE = P_COMPANY_CODE
+            AND A.STR_DTE >= (SUBSTR(V_CUR_DTE, 0, 4) - 1 || '0101')
+            AND (A.END_DTE IS NULL OR A.END_DTE >= TO_CHAR(SYSDATE, 'YYYYMMDD'))
+            AND ((P_EMP_NO IS NULL) OR (P_EMP_NO IS NOT NULL AND A.EMP_NO = P_EMP_NO))
+	)
+	LOOP
+
+    -- ===============================================================================
+    --   2-1. VARIABLE 초기화
+    -- ===============================================================================
+        V_GUNSOK_DAY      := 0;             -- 총 근속일수
+        V_GUNSOK_YY       := 0;             -- 근속년수
+        V_GUNSOK_MM       := 0;             -- 근속월수
+        V_GUNSOK_DD       := 0;             -- 근속일수
+
+        V_NEW_CNT         := 0;             -- 발생연차
+        V_IWEOL_CNT       := 0;             -- 이월연차(중도입사자 전년도 미사용 월차)
+        V_DANG_CNT        := 0;             -- 당해년도 발생월차(중도입사자)
+        V_EXCE_CNT        := 0;             -- 전년도초과사용연차
+        V_YEAR_CNT        := 0;             -- 당해년도연차합계
+        V_HALF_USE        := 0;             -- 당해년도반차사용
+        V_HHALF_USE        := 0;             -- 당해년도반반차사용
+        V_YEAR_USE        := 0;             -- 당해년도연차사용
+        V_USE_CNT         := 0;
+
+        V_SPEC_CNT        := 0;             -- 체력단련 기준
+        V_SPEC_USE        := 0;             -- 체력단련 사용
+
+        V_YEAR_PAY_CNT    := 0;             -- 지급기준연차
+        V_YEARMI_USE      := 0;             -- 미사용일수
+
+        V_ADD_CNT         := 0;
+
+        V_CALC_T_DTE      := SUBSTR(V_CUR_DTE, 0, 4) || '0101';
+
+    -- ===============================================================================
+    --   2-2. 총 근속일수 계산 : 기준일자 기준으로 계산
+    --   2-3. 근속년월일 계산
+    -- ===============================================================================
+    IF V_CALC_T_DTE > T1.CALC_F_DTE THEN
+        V_GUNSOK_DAY := TO_DATE(V_CALC_T_DTE, 'YYYYMMDD') - TO_DATE(T1.CALC_F_DTE, 'YYYYMMDD');
+
+        V_GUNSOK_RATE := ROUND(V_GUNSOK_DAY/365,1);
+
+        V_MON_CNT := TRUNC(MONTHS_BETWEEN(TO_DATE(V_CALC_T_DTE, 'YYYYMMDD') - 1, TO_DATE(T1.CALC_F_DTE, 'YYYYMMDD') - 1), 0);
+
+        V_GUNSOK_YY := TRUNC(V_MON_CNT / 12, 0);
+        V_GUNSOK_MM := MOD(V_MON_CNT, 12);
+        V_GUNSOK_DD := TO_DATE(V_CALC_T_DTE, 'YYYYMMDD') - ADD_MONTHS(TO_DATE(T1.CALC_F_DTE, 'YYYYMMDD'), V_MON_CNT);
+    END IF;
+
+    -- ===============================================================================
+    --   2-4. 발생연차 계산 : 이전년도 말을 기준으로 계산
+    -- ===============================================================================
+		V_NEW_CNT := 0;
+
+        IF T1.CALC_YN = 'Y' THEN --연차계산대상일 경우 계산 
+            /*================================임원 기준연차 계산================================*/
+            IF T1.PERS_OPT = '1' THEN --임원인 경우 입사일자와 상관없이 20개.
+                V_NEW_CNT := 20;
+            /*=======================정규직, 계약직, 파견직 기준연차 계산=======================*/
+            ELSE
+
+            	V_NEW_CNT := ROUND(CASE WHEN V_GUNSOK_RATE >= 0.8 THEN 15 ELSE 15*V_GUNSOK_RATE END,0);--당해발생연차 
+	            V_ADD_CNT := LEAST(TRUNC((V_GUNSOK_YY - 1) / 2, 0),10);
+
+                /* 전년도 1월 1일 이후 입사자 */
+                IF (SUBSTR(V_CUR_DTE, 0, 4) - 1 || '0101') <= T1.CALC_F_DTE THEN
+                    /* 전년도 발생 월 단위 연차 */
+                    SELECT NVL(SUM(A.YEAR_CNT), 0)
+                    INTO V_DANG_CNT
+                    FROM HR_TIME_YEAR A
+                    WHERE A.COMPANY_CODE = P_COMPANY_CODE
+                        AND A.YEAR = SUBSTR(V_CUR_DTE, 1, 4) - 1
+                        AND A.EMP_NO = T1.EMP_NO
+                        AND SUBSTR(V_CUR_DTE, 0, 4) != SUBSTR(T1.CALC_F_DTE, 0, 4);     -- 당해년도 입사자 제외 (계약직 전환 시 전년도 월차가 존재할 수 있음)
+
+                    -- 월단위 연차는 산정시점으로 계산 (EXCEL의 DATEDIF가 만으로 계산하기 때문에, TRUNC 처리 함)
+                    V_DANG_CNT := GREATEST(LEAST(TRUNC(MONTHS_BETWEEN(TO_DATE(NVL(T1.END_DTE, LEAST(V_CUR_DTE,TO_CHAR(SYSDATE,'YYYYMMDD'))), 'YYYYMMDD'), TO_DATE(T1.CALC_F_DTE, 'YYYYMMDD')), 0), 11) - V_DANG_CNT,0);
+
+                END IF;
+
+                DBMS_OUTPUT.PUT_LINE('V_DANG_CNT == ' || V_DANG_CNT);
+            END IF;
+        END IF;
+
+    -- ===============================================================================
+    --   2-6. 초과연차 계산
+    -- ===============================================================================
+	    SELECT
+	        NVL(SUM(A.YEARMI_USE), 0)
+	    INTO V_EXCE_CNT
+	    FROM HR_TIME_YEAR A
+	    WHERE A.COMPANY_CODE = P_COMPANY_CODE
+	        AND A.YEAR = SUBSTR(V_CUR_DTE, 1, 4) - 1
+	        AND A.EMP_NO = T1.EMP_NO;
+
+	    IF V_EXCE_CNT >= 0 THEN        -- 작년에 잔여연차가 양수인 경우
+	        V_EXCE_CNT := 0;            -- 초과연차 초기화
+	        IF V_GUNSOK_YY < 1 THEN 
+	        	V_IWEOL_CNT := V_EXCE_CNT;            -- 초과연차 초기화
+	        END IF;
+	    ELSE
+	        V_IWEOL_CNT := 0;            -- 초과연차 초기화            	
+	    END IF;
+
+    -- ===============================================================================
+    --   2-7. 당해년도 연차 계산 : 발생연차 + 월단위 연차 + 전년도 초과사용연차(-) + 가감연차
+    -- ===============================================================================
+        SELECT
+            NVL(SUM(A.ETC_CNT), 0)
+        INTO V_ETC_CNT
+        FROM HR_TIME_YEAR A
+        WHERE A.COMPANY_CODE = P_COMPANY_CODE
+            AND A.YEAR = SUBSTR(V_CUR_DTE, 1, 4)
+            AND A.EMP_NO = T1.EMP_NO;
+
+        -- 연차합계 : 발생연차 + 발생월단위연차 + 초과연차 + 전년도미사용월차 + 가감연차
+        V_YEAR_CNT := V_NEW_CNT + V_DANG_CNT + V_EXCE_CNT + V_IWEOL_CNT + V_ETC_CNT;
+
+    -- ===============================================================================
+    --   2-8. 사용연차 수 SET
+    --      : 사용연차 계산 전, 계약직 전환일 이전 사용 건 제외 여부 업데이트
+    --      : 파견직 -> 계약직 전환 시 : 발생연차, 사용연차는 초기화. 단, 사용일수에 대한 이력은 남아야 함.
+    -- ===============================================================================
+        MERGE INTO HR_TIME_ATTEND_D A 
+        USING(
+            SELECT
+                A.COMPANY_CODE
+                , A.EMP_NO
+                , A.ATTEND_DTE
+                , A.ST_CODE
+                , CASE WHEN A.ATTEND_DTE < NVL(T1.IN_COMP_DTE, T1.STR_DTE) THEN 'Y' ELSE 'N' END AS EXC_YN
+            FROM HR_TIME_ATTEND_D A
+            INNER JOIN SM_CODE_VALIDATION B ON A.COMPANY_CODE = B.COMPANY_CODE AND A.ST_CODE = B.VAL_CODE
+            WHERE A.COMPANY_CODE = P_COMPANY_CODE
+                AND A.ATTEND_DTE <= T1.IN_COMP_DTE
+                AND A.EMP_NO = T1.EMP_NO
+                AND NVL(B.VALUE_CONF5, '^') = 'HR38302'
+        ) B ON (
+            A.COMPANY_CODE = B.COMPANY_CODE
+            AND A.EMP_NO = B.EMP_NO
+            AND A.ATTEND_DTE = B.ATTEND_DTE
+            AND A.ST_CODE = B.ST_CODE
+        )
+        WHEN MATCHED THEN
+            UPDATE SET
+                FIL5 = B.EXC_YN;
+
+        SELECT
+            NVL(SUM(CASE WHEN B.ST_CODE != 'HR1075G' AND NVL(C.VALUE_CONF4, 'N') <> 'Y' THEN TO_NUMBER(C.VALUE_CONF3) ELSE 0 END), 0) AS YEARUSE_CNT
+            , NVL(SUM(CASE WHEN B.ST_CODE != 'HR1075G' AND NVL(C.VALUE_CONF4, 'N') = 'Y' THEN TO_NUMBER(C.VALUE_CONF3) ELSE 0 END), 0) AS HALFUSE_CNT
+            , NVL(SUM(CASE WHEN B.ST_CODE != 'HR1075G' AND NVL(C.VALUE_CONF6, 'N') = 'Y' THEN TO_NUMBER(C.VALUE_CONF3) ELSE 0 END), 0) AS HHALFUSE_CNT
+            , NVL(SUM(CASE WHEN B.ST_CODE = 'HR1075G' THEN 1 ELSE 0 END), 0) AS SPECUSE_CNT
+        INTO V_YEAR_USE, V_HALF_USE,V_HHALF_USE, V_SPEC_USE
+        FROM HR_TIME_ATTEND_M A
+        INNER JOIN HR_TIME_ATTEND_D B ON A.COMPANY_CODE = B.COMPANY_CODE AND A.EMP_NO = B.EMP_NO AND A.ATTEND_DTE = B.ATTEND_DTE
+        INNER JOIN SM_CODE_VALIDATION C ON B.COMPANY_CODE = C.COMPANY_CODE AND B.ST_CODE = C.VAL_CODE
+        WHERE A.COMPANY_CODE = P_COMPANY_CODE
+            AND SUBSTR(A.ATTEND_DTE, 1, 4) = SUBSTR(V_CUR_DTE, 1, 4)
+            AND A.EMP_NO = T1.EMP_NO
+            AND NVL(A.END_YN, 'N') = 'Y'
+            AND NVL(B.CUR_YN, 'N') = 'Y'
+            AND NVL(B.FIL5, 'N') != 'Y'
+            AND (C.VALUE_CONF5 = 'HR38302' OR C.VAL_CODE = 'HR1075G');
+
+        V_USE_CNT := (V_HALF_USE + V_HHALF_USE + V_YEAR_USE);
+
+    -- ===============================================================================
+    --   2-9. 미사용연차 수 SET
+    -- ===============================================================================
+      V_YEARMI_USE := V_YEAR_CNT - V_USE_CNT;
+
+    -- ===============================================================================
+    --   2-10. 체력단련휴가일수 계산
+    -- ===============================================================================
+        IF T1.SPEC_YN = 'Y' THEN
+            IF SUBSTR(T1.CALC_F_DTE, 0, 4) < SUBSTR(V_CUR_DTE, 0, 4) THEN
+                V_SPEC_CNT := 3;
+            ELSE
+                IF TO_NUMBER(SUBSTR(T1.CALC_F_DTE, 5, 2)) BETWEEN 1 AND 4 THEN
+                    V_SPEC_CNT := 3;
+                ELSIF TO_NUMBER(SUBSTR(T1.CALC_F_DTE, 5, 2)) BETWEEN 5 AND 8 THEN
+                    V_SPEC_CNT := 2;
+                ELSIF TO_NUMBER(SUBSTR(T1.CALC_F_DTE, 5, 2)) BETWEEN 9 AND 12 THEN
+                    V_SPEC_CNT := 1;
+                END IF;
+            END IF;
+        END IF;
+
+    -- ===============================================================================
+    --   ## HR_TIME_YEAR 저장
+    -- ===============================================================================
+        MERGE INTO HR_TIME_YEAR A 
+        USING(
+            SELECT
+                P_COMPANY_CODE AS COMPANY_CODE
+                , SUBSTR(V_CUR_DTE, 0, 4) AS YEAR
+                , T1.EMP_NO AS EMP_NO
+            FROM DUAL
+        ) B ON (
+            A.COMPANY_CODE = B.COMPANY_CODE
+            AND A.YEAR = B.YEAR
+            AND A.EMP_NO = B.EMP_NO
+        )
+        WHEN MATCHED THEN
+            UPDATE SET
+                STR_DTE = T1.CALC_F_DTE
+                , END_DTE = T1.END_DTE
+                , GUNSOK_DAY = V_GUNSOK_DAY
+                , GUNSOK_YY = V_GUNSOK_YY
+                , GUNSOK_MM = V_GUNSOK_MM
+                , GUNSOK_DD = V_GUNSOK_DD
+                , NEW_CNT = V_NEW_CNT
+                , EXCE_CNT = V_EXCE_CNT
+                , IWEOL_CNT = V_IWEOL_CNT
+                , DANG_CNT = V_DANG_CNT
+                , YEAR_CNT = V_YEAR_CNT
+                , HALF_USE = V_HALF_USE
+                , HHALF_USE = V_HHALF_USE
+                , YEAR_USE = V_YEAR_USE
+                , YEARMI_USE = V_YEARMI_USE
+                , SPEC_HOLI_CNT = V_SPEC_CNT
+                , SPEC_HOLI_USE = V_SPEC_USE
+                , STD_EXC_CNT = 0
+                , YEAR_PAY_CNT = V_YEAR_PAY_CNT
+                , LST_CALC_DTE = V_CUR_DTE
+                , CHG_DATE = SYSDATE
+                , CHG_DUTY_ID = P_INPUT_DUTY_ID
+        WHEN NOT MATCHED THEN
+            INSERT (
+                COMPANY_CODE
+                , YEAR
+                , EMP_NO
+                , BASIC_DTE
+                , STR_DTE
+                , END_DTE
+                , GUNSOK_DAY
+                , GUNSOK_YY
+                , GUNSOK_MM
+                , GUNSOK_DD
+                , NEW_CNT
+                , EXCE_CNT
+                , IWEOL_CNT
+                , DANG_CNT
+                , YEAR_CNT
+                , HALF_USE
+                , HHALF_USE
+                , YEAR_USE
+                , YEARMI_USE
+                , SPEC_HOLI_CNT
+                , SPEC_HOLI_USE
+                , STD_EXC_CNT
+                , YEAR_PAY_CNT
+                , LST_CALC_DTE
+                , INPUT_DATE
+                , INPUT_DUTY_ID
+                , CHG_DATE
+                , CHG_DUTY_ID
+            ) VALUES (
+                P_COMPANY_CODE
+                , SUBSTR(V_CUR_DTE, 1, 4)
+                , T1.EMP_NO
+                , V_CALC_T_DTE
+                , T1.CALC_F_DTE
+                , T1.END_DTE
+                , V_GUNSOK_DAY
+                , V_GUNSOK_YY
+                , V_GUNSOK_MM
+                , V_GUNSOK_DD
+                , V_NEW_CNT
+                , V_EXCE_CNT
+                , V_IWEOL_CNT
+                , V_DANG_CNT
+                , V_YEAR_CNT
+                , V_HALF_USE
+                , V_HHALF_USE
+                , V_YEAR_USE
+                , V_YEARMI_USE
+                , V_SPEC_CNT
+                , V_SPEC_USE
+                , 0
+                , V_YEAR_PAY_CNT
+                , V_CUR_DTE
+                , SYSDATE
+                , P_INPUT_DUTY_ID
+                , SYSDATE
+                , P_INPUT_DUTY_ID
+            );
+
+	END LOOP;
+
+EXCEPTION
+   WHEN NO_DATA_FOUND THEN
+      ROLLBACK;
+      RAISE_APPLICATION_ERROR (-20041, SQLERRM);
+
+   WHEN DUP_VAL_ON_INDEX THEN
+      ROLLBACK;
+      RAISE_APPLICATION_ERROR (-20042, SQLERRM);
+
+   WHEN INVALID_NUMBER THEN
+      ROLLBACK;
+      RAISE_APPLICATION_ERROR (-20043, SQLERRM);
+
+   WHEN TOO_MANY_ROWS THEN
+      ROLLBACK;
+      RAISE_APPLICATION_ERROR (-20044, SQLERRM);
+
+   WHEN VALUE_ERROR THEN
+      ROLLBACK;
+      RAISE_APPLICATION_ERROR (-20045, SQLERRM);
+
+   WHEN OTHERS THEN
+      ROLLBACK;
+      RAISE_APPLICATION_ERROR (-20046, SQLERRM);
+
+END PROC_HR_TIME_YEAR_BATCH;
